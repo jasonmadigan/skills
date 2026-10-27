@@ -46,11 +46,11 @@ Always run the dry run first and show the user the report: sections added, delet
 What the helper does:
 
 1. Reads the tab with `documents.get` (tab content included) and parses the local markdown into the same block model.
-2. Splits both into sections by heading (heading text, with `#2`, `#3` suffixes for duplicates).
-3. **Snapshot check.** `local.md.gdocsync.<tab>.json` holds the tab as it was after the last sync. Sections changed in the doc since then are listed; sections changed on both sides abort the push unless `--force`. No snapshot means edits made in the doc by others cannot be detected: say so.
+2. Splits both into sections by heading. A section's key is its heading text under the headings enclosing it (`Week of 19th October, 2026 / Shipped`), with `#2`, `#3` suffixes for duplicates under the same parent, so adding a week above the others leaves the older weeks' keys alone. A key found once on each side pairs the two sections. Between those pairs, the rest are aligned in order: same key and content, same key, then same heading (a section under a renamed parent). A single section left on each side in the same place is a renamed heading. A repeated heading therefore pairs by its content, not its `#n`.
+3. **Snapshot check.** `local.md.gdocsync.<tab>.json` holds the tab as it was after the last sync. Sections changed in the doc since then are listed; sections changed on both sides abort the push unless `--force`. A local section is compared with the snapshot of the doc section it pairs with. No snapshot means edits made in the doc by others cannot be detected: say so. A snapshot written before heading-path keys is re-keyed against the doc's current headings.
 4. **Block diff inside each modified section.** Equal blocks are left alone. Inserted blocks are inserted after their preceding block; deleted blocks are deleted; changed blocks are deleted and re-inserted. Identity is plain text plus absolute link targets; bold and italic differences alone do not count, so the doc's own emphasis survives.
 5. **Tables.** A table that is still a table with the same column count is edited in place, never recreated: changed cells are replaced, and added or removed rows become `insertTableRow` / `deleteTableRow` with the new rows populated from a fresh index read. Only a genuinely new table, or one whose column count changed, is created from scratch after its anchor paragraph. Recreating a table would delete every comment anchored in it, so the row path matters.
-6. **Headings.** A doc paragraph whose text equals a local heading that has no heading counterpart is promoted in place with one style request, not deleted.
+6. **Headings.** A doc paragraph whose text equals a local heading that has no heading counterpart is promoted in place with one style request, not deleted. A renamed heading is edited in place: in plain text only the changed middle is replaced, so a comment on the rest keeps its anchor, and a level change is one style request. A heading with links or chips is replaced whole.
 7. **Moved sections** are reported and left in place. `--allow-move` deletes and re-inserts them, which loses comment anchors on those sections. Same constraint as cut and paste in the Docs UI. Ask before using it.
 8. All edits run highest index first, so earlier indices stay valid. Where a delete and an insert share an index the delete goes first, otherwise it removes the text just inserted. Text styles are reset on every inserted range before markers are applied, because inserted text inherits the style of its neighbour.
 9. **Lists.** Inserted text takes on the bullet of the paragraph it lands in, and `createParagraphBullets` leaves an already bulleted paragraph alone. A new item that should look exactly like that paragraph (same kind and level) keeps its bullet, and stays in its list, so numbering carries on. Any other item has the bullet dropped and rebuilt. Rebuilt bullets that join the list above put their first item at the level of the item above, whatever its tabs, and nest the rest by tabs relative to it. A first item that has to go deeper gets a placeholder at the level above, deleted in the same batch. One that has to sit shallower cannot join at all: once the tables are in, its whole run of list items is rebuilt from the local file (bullets off, one tab per level, bullets on). That run becomes a new list with the preset's glyphs.
@@ -105,7 +105,7 @@ The local file is rebuilt section by section in the doc's order. A section whose
 - One local file maps to one tab, by design.
 - A change of list level or kind on its own is neither pushed nor pulled: block identity is text plus links.
 - A new table needs its anchor paragraph in the doc before the push starts. A table that follows paragraphs added by the same push fails the anchor check: push the text, then the table.
-- Sections are keyed by heading text, with `#2`, `#3` for repeats. Adding a section above another of the same name (a new week's `Shipped` above last week's) shifts every later key, so the plan pairs the wrong sections.
+- A heading renamed to the text of another section that the same push removes pairs with that section by name, so the plan rebuilds the renamed one, or stops at the anchor check when it holds a table. Merging two weeks under the second one's heading does this: remove the old section in one push, rename in the next.
 
 ## Inspecting
 
@@ -117,11 +117,13 @@ gdoc_sync.py lists DOC --tab TAB [--fix]   # list items off their level's indent
 
 `scripts/test_lists_live.py` pushes list edits of every shape to a scratch doc, checks level, indent and list membership of each item, and deletes the doc. Run it after touching the list code.
 
+`scripts/test_pairing.py` checks section pairing (repeated, renamed and moved headings) and in-place heading edits offline. Run it after touching either.
+
 Use `mcp__workspacemcp__list_document_comments` before a push that deletes or moves anything, and tell the user which comments sit on text that will be rewritten.
 
 ## Report
 
-After a push, give the user: sections added, deleted, modified, moved (or left in place with the reason), tables created or cells changed, request count, whether the verification passed, and the snapshot path. After a pull, the sections applied locally.
+After a push, give the user: sections added, deleted, modified, renamed, moved (or left in place with the reason), tables created or cells changed, request count, whether the verification passed, and the snapshot path. After a pull, the sections applied locally.
 
 ## When to sync
 

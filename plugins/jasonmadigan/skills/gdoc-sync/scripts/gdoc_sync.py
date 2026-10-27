@@ -516,6 +516,15 @@ def link_sig(run_lists):
     return (" {" + ",".join(urls) + "}") if urls else ""
 
 
+def heading_path(path, level, text):
+    """a heading's key: its text under the headings enclosing it, so a repeated subheading such as
+    each week's Shipped keeps its key when a section is added above it. path is updated in place"""
+    while path and path[-1][0] >= level:
+        path.pop()
+    path.append((level, text))
+    return " / ".join(t for _, t in path)
+
+
 def sections(blocks):
     """list of dicts: heading block (or None), body blocks, key"""
     out = []
@@ -529,27 +538,83 @@ def sections(blocks):
                 continue  # empty doc paragraphs carry no content
             cur["blocks"].append(b)
     out.append(cur)
-    seen = {}
+    seen, flat_seen, path = {}, {}, []
     for s in out:
-        base = norm(s["heading"]["text"]) if s["heading"] else "(preamble)"
+        text = norm(s["heading"]["text"]) if s["heading"] else "(preamble)"
+        base = heading_path(path, s["heading"]["level"], text) if s["heading"] else text
         seen[base] = seen.get(base, 0) + 1
+        s["path"] = base
         s["key"] = base if seen[base] == 1 else f"{base} #{seen[base]}"
+        # the key snapshots used before heading paths, kept so those can still be read
+        flat_seen[text] = flat_seen.get(text, 0) + 1
+        s["flat"] = text if flat_seen[text] == 1 else f"{text} #{flat_seen[text]}"
         s["plain"] = "\n".join(block_key(b) for b in s["blocks"])
     return out
 
 
-def side_by_side(local_secs, doc_secs):
-    dkeys = {s["key"]: s for s in doc_secs}
-    lkeys = {s["key"]: s for s in local_secs}
-    added = [s for s in local_secs if s["key"] not in dkeys]
-    deleted = [s for s in doc_secs if s["key"] not in lkeys]
-    modified = [s for s in local_secs if s["key"] in dkeys and dkeys[s["key"]]["plain"] != s["plain"]]
-    order_local = [s["key"] for s in local_secs if s["key"] in dkeys]
-    order_doc = [s["key"] for s in doc_secs if s["key"] in lkeys]
+def heading_key(s):
+    return block_key(s["heading"]) if s["heading"] else s["path"]
+
+
+# whole section, heading path, then heading and body, heading alone: the last two pair sections whose parent was renamed
+PASSES = (lambda s: (s["path"], s["plain"]), lambda s: s["path"], lambda s: (heading_key(s), s["plain"]), heading_key)
+
+
+def align(ls, ds, passes, pairs):
+    """pair local and doc sections in order by the first signature, and by the next ones inside what is left.
+    one section left on each side when the signatures run out holds the same place under a new heading"""
+    if not ls or not ds:
+        return
+    if not passes:
+        if len(ls) == len(ds) == 1:
+            pairs.append((ls[0], ds[0]))
+        return
+    sm = difflib.SequenceMatcher(None, [passes[0](s) for s in ds], [passes[0](s) for s in ls], autojunk=False)
+    for tag, i1, i2, j1, j2 in sm.get_opcodes():
+        if tag == "equal":
+            pairs.extend(zip(ls[j1:j2], ds[i1:i2]))
+        else:
+            align(ls[j1:j2], ds[i1:i2], passes[1:], pairs)
+
+
+def pair_sections(local_secs, doc_secs):
+    """(local, doc) pairs of the same section, and the local keys whose pair is out of order.
+    a heading path found once on each side pairs by itself, and those pairs that are in order are fixed points.
+    sections between two fixed points are aligned by PASSES, so a repeated heading pairs by content instead of
+    by its #n, and a renamed heading keeps its section"""
+    lcount, dcount = {}, {}
+    for s in local_secs:
+        lcount[s["path"]] = lcount.get(s["path"], 0) + 1
+    for s in doc_secs:
+        dcount[s["path"]] = dcount.get(s["path"], 0) + 1
+    single = {s["path"]: s for s in doc_secs if dcount[s["path"]] == 1}
+    pairs = [(s, single[s["path"]]) for s in local_secs if lcount[s["path"]] == 1 and s["path"] in single]
+    paired = {l["path"] for l, _ in pairs}
+    order_doc = [s["path"] for s in doc_secs if s["path"] in paired]
+    order_local = [l["path"] for l, _ in pairs]
     sm = difflib.SequenceMatcher(None, order_doc, order_local, autojunk=False)
-    stable = {k for tag, i1, i2, j1, j2 in sm.get_opcodes() if tag == "equal" for k in order_doc[i1:i2]}
-    moved = [k for k in order_local if k not in stable]
-    return added, deleted, modified, moved, dkeys, lkeys
+    stable = {p for tag, i1, i2, j1, j2 in sm.get_opcodes() if tag == "equal" for p in order_doc[i1:i2]}
+    moved = [l["key"] for l, _ in pairs if l["path"] not in stable]
+    lpos = {id(s): i for i, s in enumerate(local_secs)}
+    dpos = {id(s): i for i, s in enumerate(doc_secs)}
+    fixed = [(-1, -1)] + [(lpos[id(l)], dpos[id(d)]) for l, d in pairs if l["path"] in stable] + [(len(local_secs), len(doc_secs))]
+    taken = {id(s) for pair in pairs for s in pair}
+    for (l0, d0), (l1, d1) in zip(fixed, fixed[1:]):
+        align([s for s in local_secs[l0 + 1:l1] if id(s) not in taken],
+              [s for s in doc_secs[d0 + 1:d1] if id(s) not in taken], PASSES, pairs)
+    return pairs, moved
+
+
+def side_by_side(local_secs, doc_secs):
+    """twin maps a local section key to its doc section; a twin whose heading differs is a rename"""
+    pairs, moved = pair_sections(local_secs, doc_secs)
+    twin = {l["key"]: d for l, d in pairs}
+    paired = {id(d) for d in twin.values()}
+    added = [s for s in local_secs if s["key"] not in twin]
+    deleted = [s for s in doc_secs if id(s) not in paired]
+    modified = [s for s in local_secs if s["key"] in twin
+                and (twin[s["key"]]["plain"] != s["plain"] or heading_key(twin[s["key"]]) != heading_key(s))]
+    return added, deleted, modified, moved, twin
 
 
 # ---------------------------------------------------------------- request builders
@@ -707,6 +772,42 @@ def delete_range(tab, blocks, seg_end):
     return {"deleteContentRange": {"range": rng(tab, a, b)}}
 
 
+def heading_edit(tab, dh, lh, doomed):
+    """rewrite the doc heading dh as the local heading lh in place, so its section and comments stay put.
+    plain text whose characters map one to one onto indices only has the changed middle replaced, taking the style
+    around it; text with links or chips is replaced whole and styled from the local runs"""
+    reqs = []
+    if dh["level"] != lh["level"]:
+        # the paragraph style goes first: it clears direct character formatting
+        reqs.append({"updateParagraphStyle": {"range": rng(tab, dh["start"], dh["end"]),
+                                              "paragraphStyle": {"namedStyleType": "HEADING_%d" % lh["level"]},
+                                              "fields": "namedStyleType"}})
+    old, new = dh["text"], lh["text"]
+    if norm(old) == norm(new) and links(dh["runs"]) == links(lh["runs"]):
+        pass
+    elif not links(dh["runs"]) and not links(lh["runs"]) and dh["end"] - dh["start"] == ulen(old) + 1:
+        p = 0
+        while p < min(len(old), len(new)) and old[p] == new[p]:
+            p += 1
+        s = 0
+        while s < min(len(old), len(new)) - p and old[-1 - s] == new[-1 - s]:
+            s += 1
+        at = dh["start"] + ulen(old[:p])
+        gone, put = old[p:len(old) - s], new[p:len(new) - s]
+        if gone:
+            reqs.append({"deleteContentRange": {"range": rng(tab, at, at + ulen(gone))}})
+            doomed.append(gone)
+        if put:
+            reqs.append({"insertText": {"location": loc(tab, at), "text": put}})
+    else:
+        if dh["end"] - 1 > dh["start"]:
+            reqs.append({"deleteContentRange": {"range": rng(tab, dh["start"], dh["end"] - 1)}})
+            doomed.append(old)
+        reqs.append({"insertText": {"location": loc(tab, dh["start"]), "text": "".join(t for t, _ in lh["runs"])}})
+        reqs.extend(style_requests(tab, dh["start"], lh["runs"]))
+    return (dh["start"], "heading", reqs)
+
+
 # ---------------------------------------------------------------- planning
 
 def row_key(row):
@@ -795,7 +896,8 @@ def plan_section(tab, lsec, dsec, seg_end, pending_tables, pending_rows, doomed,
                 index, at_end = anchor_block["end"], False
             if index >= seg_end:
                 index, at_end = seg_end - 1, True
-            ops.append((index, "insert", new, at_end, lsec["key"], block_key(anchor_block) if anchor_block is not None and anchor_block["kind"] == "p" else None,
+            # the heading anchors as None, which still finds it once it has been renamed
+            ops.append((index, "insert", new, at_end, lsec["key"], block_key(anchor_block) if i1 > 0 and anchor_block["kind"] == "p" else None,
                         context(index, at_end, old[-1]["end"] if old else None)))
     return ops
 
@@ -827,26 +929,32 @@ def expand_insert(tab, index, blocks, at_end, pending_tables, section_key, ancho
     return reqs
 
 
-def build_plan(tab, local_secs, doc_secs, seg_end, allow_move, dblocks):
-    added, deleted, modified, moved, dkeys, lkeys = side_by_side(local_secs, doc_secs)
+def build_plan(tab, local_secs, side, seg_end, allow_move, dblocks):
+    """side is what side_by_side returned for local_secs against the doc"""
+    added, deleted, modified, moved, twin = side
     report = {"added": [s["key"] for s in added], "deleted": [s["key"] for s in deleted],
-              "modified": [s["key"] for s in modified], "moved": moved, "tables": []}
+              "modified": [s["key"] for s in modified],
+              "renamed": [f"{twin[s['key']]['key']} -> {s['key']}" for s in modified if heading_key(s) != heading_key(twin[s["key"]])],
+              "moved": moved, "tables": []}
     if moved and not allow_move:
         report["warning"] = "section order differs; order is left as-is (pass --allow-move to delete and re-insert, which loses comment anchors on those sections)"
     if moved and allow_move:
         # a moved section is deleted where it is and re-inserted where the local file has it
-        deleted = deleted + [dkeys[k] for k in moved]
+        lkeys = {s["key"]: s for s in local_secs}
+        deleted = deleted + [twin[k] for k in moved]
         added = added + [lkeys[k] for k in moved]
         modified = [s for s in modified if s["key"] not in moved]
         added.sort(key=lambda s: local_secs.index(s))
-    anchors = {s["key"] for s in local_secs if s["key"] in dkeys and s["key"] not in moved}
+    anchors = {s["key"] for s in local_secs if s["key"] in twin and s["key"] not in moved}
     ops = []
     pending_tables = []
     pending_rows = []
     doomed = []
     context = list_context(dblocks, seg_end)
     for s in modified:
-        ops.extend(plan_section(tab, s, dkeys[s["key"]], seg_end, pending_tables, pending_rows, doomed, context))
+        if heading_key(s) != heading_key(twin[s["key"]]):
+            ops.append(heading_edit(tab, twin[s["key"]]["heading"], s["heading"], doomed))
+        ops.extend(plan_section(tab, s, twin[s["key"]], seg_end, pending_tables, pending_rows, doomed, context))
     for s in deleted:
         blocks = [s["heading"]] + s["blocks"] if s["heading"] else s["blocks"]
         if blocks:
@@ -857,15 +965,15 @@ def build_plan(tab, local_secs, doc_secs, seg_end, allow_move, dblocks):
         pos = local_secs.index(s)
         nxt = next((x for x in local_secs[pos + 1:] if x["key"] in anchors), None)
         blocks = ([s["heading"]] if s["heading"] else []) + s["blocks"]
-        if nxt is not None and dkeys[nxt["key"]]["heading"] is not None:
-            at = dkeys[nxt["key"]]["heading"]["start"]
+        if nxt is not None and twin[nxt["key"]]["heading"] is not None:
+            at = twin[nxt["key"]]["heading"]["start"]
             ops.append((at, "insert", blocks, False, s["key"], None, context(at, False)))
         else:
             ops.append((seg_end - 1, "insert", blocks, True, s["key"], None, context(seg_end - 1, True)))
     # materialise, highest index first so earlier indices stay valid.
     # at a shared index a delete must run before an insert, or it eats the text just inserted;
     # inserts sharing an index go last-first, so the first one ends up on top.
-    rank = {"delete": 0, "cell": 1, "insert": 2}
+    rank = {"delete": 0, "cell": 1, "heading": 1, "insert": 2}
     ops = [(o, n) for n, o in enumerate(ops)]
     ops.sort(key=lambda t: (t[0][0], -rank[t[0][1]], t[1]), reverse=True)
     ops = [o for o, _ in ops]
@@ -1053,10 +1161,11 @@ def comments_at_risk(comments, doomed_text):
     return hits
 
 
-def check_anchors(blocks, pending_tables):
-    """resolve every deferred anchor before anything is written, so a push cannot stop half way"""
+def check_anchors(blocks, pending_tables, twin):
+    """resolve every deferred anchor before anything is written, so a push cannot stop half way.
+    a section that is renamed is still under its doc heading at this point, so it is looked up through its twin"""
     for t in pending_tables:
-        locate_anchor(None, blocks, t["section"], t["anchor"])
+        locate_anchor(None, blocks, twin[t["section"]]["key"] if t["section"] in twin else t["section"], t["anchor"])
 
 
 # ---------------------------------------------------------------- snapshot
@@ -1071,7 +1180,8 @@ def load_base(path, tab):
 
 
 def save_base(path, tab, doc_id, doc_secs):
-    sidecar(path, tab).write_text(json.dumps({"doc": doc_id, "tab": tab, "sections": {s["key"]: s["plain"] for s in doc_secs}}, indent=1))
+    sidecar(path, tab).write_text(json.dumps({"doc": doc_id, "tab": tab, "keys": "heading-path",
+                                              "sections": {s["key"]: s["plain"] for s in doc_secs}}, indent=1))
 
 
 # ---------------------------------------------------------------- commands
@@ -1122,7 +1232,7 @@ def raw_sections(md):
             starts.append(i)
     bounds = [0] + starts + [len(lines)]
     # sections() always yields a leading preamble, even an empty one; mirror that so the keys line up
-    out, seen = ([] if (not starts or starts[0] != 0) else [("(preamble)", "")]), {}
+    out, seen, path = ([] if (not starts or starts[0] != 0) else [("(preamble)", "")]), {}, []
     for a, b in zip(bounds, bounds[1:]):
         if a == b:  # a file that opens with a heading has no preamble
             continue
@@ -1130,7 +1240,7 @@ def raw_sections(md):
             key = "(preamble)"
         else:
             hb = local_blocks(lines[a])
-            key = norm(hb[0]["text"]) if hb else norm(lines[a])
+            key = heading_path(path, hb[0]["level"], norm(hb[0]["text"])) if hb else norm(lines[a])
         seen[key] = seen.get(key, 0) + 1
         if seen[key] > 1:
             key = f"{key} #{seen[key]}"
@@ -1281,14 +1391,24 @@ def cmd_push(a):
     promote = promote_headings(a.tab, local, dblocks)
     doc_secs = sections(dblocks)
     seg_end = segment_end(tab)
+    side = side_by_side(local_secs, doc_secs)
+    twin = side[4]
 
     base = load_base(path, a.tab)
     if base and base.get("doc") != a.doc:
         print(f"snapshot belongs to document {base.get('doc')}, not {a.doc}; ignoring it")
         base = None
+    if base and base.get("keys") != "heading-path":
+        # written before sections were keyed by heading path: re-key it by the doc's current headings
+        flat = {s["flat"]: s["key"] for s in doc_secs}
+        base["sections"] = {flat[k]: v for k, v in base["sections"].items() if k in flat}
+        print("snapshot predates heading-path keys; re-keyed against the doc's current headings")
     if base:
-        changed_in_doc = {k for k, v in base["sections"].items() if k in {s["key"]: 1 for s in doc_secs} and next(s for s in doc_secs if s["key"] == k)["plain"] != v}
-        changed_locally = {s["key"] for s in local_secs if s["key"] in base["sections"] and base["sections"][s["key"]] != s["plain"]}
+        doc_now = {s["key"]: s["plain"] for s in doc_secs}
+        changed_in_doc = {k for k, v in base["sections"].items() if k in doc_now and doc_now[k] != v}
+        # a local section is held against the snapshot of its twin, whose key a rename or a shifted #n leaves alone
+        changed_locally = {twin[s["key"]]["key"] for s in local_secs
+                           if s["key"] in twin and base["sections"].get(twin[s["key"]]["key"], s["plain"]) != s["plain"]}
         conflicts = sorted(changed_in_doc & changed_locally)
         doc_only = sorted(changed_in_doc - changed_locally)
         if doc_only:
@@ -1304,9 +1424,9 @@ def cmd_push(a):
     else:
         print("no snapshot yet; cannot detect edits made in the doc since the last sync")
 
-    requests, pending, pending_rows, doomed, report, inserted_items = build_plan(a.tab, local_secs, doc_secs, seg_end, a.allow_move, dblocks)
+    requests, pending, pending_rows, doomed, report, inserted_items = build_plan(a.tab, local_secs, side, seg_end, a.allow_move, dblocks)
     report["promoted_headings"] = len(promote)
-    check_anchors(dblocks, pending)  # fail before writing, never half way through
+    check_anchors(dblocks, pending, twin)  # fail before writing, never half way through
     risky = comments_at_risk(doc_comments(a.email, a.doc), doomed)
     if risky:
         print(f"{len(risky)} comment(s) are anchored to text this push rewrites:")
@@ -1406,7 +1526,7 @@ def cmd_push(a):
     doc = get_doc(svc, a.doc)
     tab = find_tab(doc, a.tab)
     doc_secs = sections(doc_blocks(tab))
-    added, deleted, modified, moved, _, _ = side_by_side(local_secs, doc_secs)
+    added, deleted, modified, moved, _ = side_by_side(local_secs, doc_secs)
     if added or deleted or modified:
         print("VERIFY: residual differences after push:", json.dumps({"added": [s["key"] for s in added], "deleted": [s["key"] for s in deleted], "modified": [s["key"] for s in modified]}, ensure_ascii=False))
     else:
