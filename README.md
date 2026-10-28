@@ -8,6 +8,7 @@ Claude Code plugin by Jason Madigan.
 |-|-|
 | `external-contribs` | Find external issues/PRs in a GitHub org that need attention |
 | `gdoc-sync` | Sync a markdown file with one tab of a Google Doc, editing in place so comments on untouched text survive |
+| `irish-british-humour` | Write casual or technical prose in a dry Irish or British comedic voice |
 
 ## Install
 
@@ -21,6 +22,7 @@ Then:
 ```
 /jasonmadigan:external-contribs Kuadrant
 /jasonmadigan:gdoc-sync push notes.md to https://docs.google.com/document/d/<id>/edit as you@example.com
+/jasonmadigan:irish-british-humour write a leaving card for a colleague
 ```
 
 ## Prerequisites
